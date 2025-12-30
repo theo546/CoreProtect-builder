@@ -23,16 +23,47 @@ jobs:
           echo "Latest SHA: $UPSTREAM_SHA"
           echo "Short SHA: $SHORT_SHA"
           
-          # Check if a release for this SHA already exists in THIS repository
+          # Check if a release for this specific SHA already exists
           if gh release view "build-$SHORT_SHA" --repo ${{ github.repository }} > /dev/null 2>&1; then
             echo "Release build-$SHORT_SHA already exists. Skipping build."
             echo "exists=true" >> $GITHUB_OUTPUT
             exit 0
-          else
-            echo "Release build-$SHORT_SHA does not exist. Proceeding with build."
+          fi
+
+          # Get the latest release to compare against
+          LATEST_RELEASE=$(gh release list --limit 1 --repo ${{ github.repository }} --json tagName --jq '.[0].tagName')
+          
+          if [ -z "$LATEST_RELEASE" ]; then
+            echo "No previous releases found. First run? Proceeding with build."
             echo "exists=false" >> $GITHUB_OUTPUT
             echo "sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
             echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "Found previous release: $LATEST_RELEASE"
+            # Extract SHA from tag "build-xxxxxxx"
+            PREV_SHA=${LATEST_RELEASE#build-}
+            echo "Previous SHA: $PREV_SHA"
+            
+            # Clone upstream to check diff
+            git clone https://github.com/PlayPro/CoreProtect.git temp_upstream
+            cd temp_upstream
+            
+            # Check for Java file changes
+            CHANGED_JAVA_FILES=$(git diff --name-only "$PREV_SHA" "$UPSTREAM_SHA" | grep ".java$" || true)
+            
+            if [ -z "$CHANGED_JAVA_FILES" ]; then
+              echo "No .java files changed between $PREV_SHA and $UPSTREAM_SHA. Skipping build."
+              echo "exists=true" >> $GITHUB_OUTPUT # Treat as "exists" to skip downstream steps
+              exit 0
+            else
+              echo "Java files changed. Proceeding with build."
+              echo "exists=false" >> $GITHUB_OUTPUT
+              echo "sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+              echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+            fi
+            cd ..
+            rm -rf temp_upstream
           fi
 
       - name: Checkout CoreProtect
@@ -73,3 +104,14 @@ jobs:
             --title "CoreProtect Build ${{ steps.check.outputs.short_sha }}" \
             --notes "Automated build of PlayPro/CoreProtect@${{ steps.check.outputs.sha }}" \
             --prerelease
+
+      - name: Cleanup Old Releases
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Keep only the 5 most recent releases
+          gh release list --repo ${{ github.repository }} --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' | while read -r tag; do
+            echo "Deleting old release: $tag"
+            gh release delete "$tag" --repo ${{ github.repository }} --yes --cleanup-tag
+          done
